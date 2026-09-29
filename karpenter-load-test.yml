@@ -1,0 +1,517 @@
+name: Karpenter - Load Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      replicas_peak:
+        description: "Nombre de réplicas au pic de charge"
+        required: true
+        default: "20"
+
+      namespace:
+        description: "Namespace de test"
+        required: true
+        default: "feature"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  NS: ${{ github.event.inputs.namespace }}
+  REPLICAS_PEAK: ${{ github.event.inputs.replicas_peak }}
+  NODEPOOL: general
+
+jobs:
+
+  load-test:
+
+    name: Scale-up / Scale-down / Non-regression
+
+    runs-on:
+      - self-hosted
+      - vpc-runner
+
+    timeout-minutes: 30
+
+    steps:
+
+      # ============================================================
+      # 1. CHECKOUT
+      # ============================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      # ============================================================
+      # 2. AWS
+      # ============================================================
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ca-central-1
+
+
+      # ============================================================
+      # 3. KUBECTL
+      # ============================================================
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ secrets.FEATURE_CLUSTER_NAME }}" \
+            --region ca-central-1
+
+          kubectl cluster-info
+
+
+      # ============================================================
+      # 4. ÉTAT INITIAL
+      # ============================================================
+
+      - name: Baseline - existing applications
+        run: |
+
+          echo "========================================="
+          echo "ÉTAT INITIAL"
+          echo "========================================="
+
+          echo "=== Nodes ==="
+
+          kubectl get nodes -o wide
+
+          kubectl get nodes \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+            | tee nodes-before.txt
+
+
+          echo "=== Karpenter nodes ==="
+
+          kubectl get nodes \
+            -l "karpenter.sh/nodepool=$NODEPOOL" \
+            --no-headers \
+            | wc -l \
+            | tee karpenter-nodes-before.txt
+
+
+          echo "=== NodeClaims ==="
+
+          kubectl get nodeclaims -o wide || true
+
+
+          echo "=== Applications existantes ==="
+
+          kubectl get pods -A
+
+
+      # ============================================================
+      # 5. VÉRIFICATION ÉTAT INITIAL
+      # ============================================================
+
+      - name: Validate initial state
+        run: |
+
+          echo "Vérification des applications existantes..."
+
+          BAD=$(kubectl get pods -A -o json | jq -r '
+            .items[]
+            | select(
+                .metadata.namespace != "'"$NS"'"
+                and (
+                  .status.phase == "Failed"
+                  or .status.phase == "Unknown"
+                )
+              )
+            | "\(.metadata.namespace)/\(.metadata.name) phase=\(.status.phase)"
+          ')
+
+          if [ -n "$BAD" ]; then
+
+            echo "::error::Des Pods sont déjà en erreur avant le test:"
+            echo "$BAD"
+
+            exit 1
+
+          fi
+
+          echo "✅ État initial OK"
+
+
+      # ============================================================
+      # 6. DÉPLOIEMENT DU MANIFEST DE TEST
+      # ============================================================
+
+      - name: Deploy load test manifest
+        run: |
+
+          kubectl create namespace "$NS" \
+            --dry-run=client \
+            -o yaml \
+            | kubectl apply -f -
+
+          kubectl apply \
+            -f karpenter/tests/load-test.yaml
+
+          kubectl get deployment \
+            karpenter-load-test \
+            -n "$NS"
+
+
+      # ============================================================
+      # 7. SCALE-UP
+      # ============================================================
+
+      - name: Scale-up - trigger
+        run: |
+
+          echo "SCALEUP_START=$(date +%s)" >> "$GITHUB_ENV"
+
+          echo "Scale : 0 → $REPLICAS_PEAK"
+
+          kubectl scale deployment \
+            karpenter-load-test \
+            -n "$NS" \
+            --replicas="$REPLICAS_PEAK"
+
+
+      # ============================================================
+      # 8. ATTENDRE LES PODS
+      # ============================================================
+
+      - name: Scale-up - wait for rollout
+        run: |
+
+          kubectl rollout status \
+            deployment/karpenter-load-test \
+            -n "$NS" \
+            --timeout=480s
+
+
+      # ============================================================
+      # 9. VALIDER LE SCALE-UP
+      # ============================================================
+
+      - name: Scale-up - assert success
+        run: |
+
+          END=$(date +%s)
+
+          DURATION=$((END - SCALEUP_START))
+
+          echo "SCALEUP_SECONDS=$DURATION" >> "$GITHUB_ENV"
+
+
+          READY=$(kubectl get deployment \
+            karpenter-load-test \
+            -n "$NS" \
+            -o jsonpath='{.status.readyReplicas}')
+
+          READY=${READY:-0}
+
+
+          if [ "$READY" != "$REPLICAS_PEAK" ]; then
+
+            echo "::error::Scale-up incomplet : $READY/$REPLICAS_PEAK"
+
+            kubectl get pods \
+              -n "$NS" \
+              -l app=karpenter-load-test \
+              -o wide
+
+            exit 1
+
+          fi
+
+
+          echo "✅ Scale-up réussi"
+          echo "Pods prêts : $READY/$REPLICAS_PEAK"
+          echo "Durée : ${DURATION}s"
+
+
+      # ============================================================
+      # 10. VÉRIFIER KARPENTER
+      # ============================================================
+
+      - name: Scale-up - verify Karpenter
+        run: |
+
+          echo "=== NodeClaims ==="
+
+          kubectl get nodeclaims -o wide
+
+
+          echo "=== Nodes ==="
+
+          kubectl get nodes -o wide
+
+
+          PEAK_NODES=$(kubectl get nodes \
+            -l "karpenter.sh/nodepool=$NODEPOOL" \
+            --no-headers \
+            | wc -l)
+
+          BEFORE=$(cat karpenter-nodes-before.txt)
+
+
+          echo "Nodes Karpenter avant : $BEFORE"
+          echo "Nodes Karpenter au pic : $PEAK_NODES"
+
+
+          echo "PEAK_NODES=$PEAK_NODES" >> "$GITHUB_ENV"
+
+
+          if [ "$PEAK_NODES" -le "$BEFORE" ]; then
+
+            echo "::error::Aucun nouveau nœud Karpenter détecté"
+
+            kubectl get nodeclaims -o wide
+
+            exit 1
+
+          fi
+
+
+          echo "✅ Scale-up Karpenter confirmé"
+
+
+      # ============================================================
+      # 11. LOGS KARPENTER
+      # ============================================================
+
+      - name: Scale-up - Karpenter logs
+        run: |
+
+          kubectl logs \
+            -n karpenter \
+            -l app.kubernetes.io/name=karpenter \
+            -c controller \
+            --tail=200 \
+            | tee karpenter-scaleup.log
+
+
+      # ============================================================
+      # 12. NON-RÉGRESSION APRÈS SCALE-UP
+      # ============================================================
+
+      - name: Non-regression - after scale-up
+        run: |
+
+          BAD=$(kubectl get pods -A -o json | jq -r '
+            .items[]
+            | select(
+                .metadata.namespace != "'"$NS"'"
+                and (
+                  .status.phase == "Failed"
+                  or .status.phase == "Unknown"
+                )
+              )
+            | "\(.metadata.namespace)/\(.metadata.name) phase=\(.status.phase)"
+          ')
+
+
+          if [ -n "$BAD" ]; then
+
+            echo "::error::Applications impactées après scale-up"
+
+            echo "$BAD"
+
+            exit 1
+
+          fi
+
+
+          echo "✅ Applications existantes OK après scale-up"
+
+
+      # ============================================================
+      # 13. SUPPRIMER LA CHARGE
+      # ============================================================
+
+      - name: Remove load
+        run: |
+
+          echo "SCALEDOWN_START=$(date +%s)" >> "$GITHUB_ENV"
+
+          kubectl scale deployment \
+            karpenter-load-test \
+            -n "$NS" \
+            --replicas=0
+
+          kubectl rollout status \
+            deployment/karpenter-load-test \
+            -n "$NS" \
+            --timeout=120s || true
+
+
+      # ============================================================
+      # 14. ATTENDRE LA CONSOLIDATION
+      # ============================================================
+
+      - name: Wait for consolidation
+        run: |
+
+          BASELINE=$(cat karpenter-nodes-before.txt)
+
+          MAX_ATTEMPTS=40
+
+          echo "Baseline : $BASELINE nodes"
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+
+            CURRENT=$(kubectl get nodes \
+              -l "karpenter.sh/nodepool=$NODEPOOL" \
+              --no-headers \
+              | wc -l)
+
+            echo "Tentative $i/$MAX_ATTEMPTS"
+            echo "Nodes Karpenter : $CURRENT"
+
+
+            if [ "$CURRENT" -le "$BASELINE" ]; then
+
+              echo "CONSOLIDATION_NODES=$CURRENT" >> "$GITHUB_ENV"
+
+              echo "✅ Consolidation terminée"
+
+              break
+
+            fi
+
+
+            sleep 15
+
+          done
+
+
+      # ============================================================
+      # 15. VALIDER LE SCALE-DOWN
+      # ============================================================
+
+      - name: Assert consolidation
+        run: |
+
+          END=$(date +%s)
+
+          DURATION=$((END - SCALEDOWN_START))
+
+          echo "SCALEDOWN_SECONDS=$DURATION" >> "$GITHUB_ENV"
+
+
+          FINAL=$(kubectl get nodes \
+            -l "karpenter.sh/nodepool=$NODEPOOL" \
+            --no-headers \
+            | wc -l)
+
+          BASELINE=$(cat karpenter-nodes-before.txt)
+
+
+          if [ "$FINAL" -gt "$BASELINE" ]; then
+
+            echo "::error::Consolidation incomplète"
+
+            echo "Baseline : $BASELINE"
+            echo "Final : $FINAL"
+
+            kubectl get nodeclaims -o wide
+
+            exit 1
+
+          fi
+
+
+          echo "✅ Scale-down réussi"
+          echo "$PEAK_NODES → $FINAL nodes"
+
+
+      # ============================================================
+      # 16. NON-RÉGRESSION FINALE
+      # ============================================================
+
+      - name: Final non-regression check
+        run: |
+
+          kubectl get pods -A
+
+
+          BAD=$(kubectl get pods -A -o json | jq -r '
+            .items[]
+            | select(
+                .metadata.namespace != "'"$NS"'"
+                and (
+                  .status.phase == "Failed"
+                  or .status.phase == "Unknown"
+                )
+              )
+            | "\(.metadata.namespace)/\(.metadata.name) phase=\(.status.phase)"
+          ')
+
+
+          if [ -n "$BAD" ]; then
+
+            echo "::error::Régression détectée"
+
+            echo "$BAD"
+
+            exit 1
+
+          fi
+
+
+          echo "✅ Applications existantes toujours opérationnelles"
+
+
+      # ============================================================
+      # 17. RÉSUMÉ GITHUB ACTIONS
+      # ============================================================
+
+      - name: Summary
+        if: always()
+        run: |
+
+          {
+            echo "## Résultats du test Karpenter"
+            echo ""
+            echo "| Métrique | Valeur |"
+            echo "|---|---|"
+            echo "| Environment | $NS |"
+            echo "| NodePool | $NODEPOOL |"
+            echo "| Réplicas au pic | $REPLICAS_PEAK |"
+            echo "| Nodes avant | $(cat karpenter-nodes-before.txt) |"
+            echo "| Nodes au pic | ${PEAK_NODES:-n/a} |"
+            echo "| Nodes après consolidation | ${CONSOLIDATION_NODES:-n/a} |"
+            echo "| Durée scale-up | ${SCALEUP_SECONDS:-n/a}s |"
+            echo "| Durée scale-down | ${SCALEDOWN_SECONDS:-n/a}s |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      # ============================================================
+      # 18. CLEANUP
+      # ============================================================
+
+      - name: Cleanup load test
+        if: always()
+        run: |
+
+          kubectl delete \
+            -f karpenter/tests/load-test.yaml \
+            --ignore-not-found=true
+
+
+      # ============================================================
+      # 19. ARTIFACTS
+      # ============================================================
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: karpenter-loadtest-evidence
+
+          path: |
+            nodes-before.txt
+            karpenter-scaleup.log
+            karpenter-scaledown.log
