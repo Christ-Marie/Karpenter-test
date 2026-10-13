@@ -1,0 +1,47 @@
+
+name: Verify Karpenter
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Remplace ces labels par ceux du runner privé réel.
+    runs-on: [self-hosted, vpc-runner]
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+
+    steps:
+      - name: Verify AWS identity
+        shell: bash
+        run: |
+          aws sts get-caller-identity
+
+      - name: Configure Kubernetes access
+        shell: bash
+        run: |
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
+
+      - name: Check Kubernetes nodes
+        shell: bash
+        run: |
+          kubectl get nodes -o wide
+
+      - name: Check Karpenter resources
+        shell: bash
+        run: |
+          kubectl get nodepools
+          kubectl get nodeclaims
+          kubectl get ec2nodeclasses
+
+      - name: Find Karpenter controller
+        shell: bash
+        run: |
+          kubectl get pods -A | grep karpenter
