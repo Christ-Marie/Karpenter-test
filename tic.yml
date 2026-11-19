@@ -1,0 +1,171 @@
+# Documentation technique – Karpenter sur Amazon EKS
+
+## 1. Présentation du projet
+
+Karpenter est un outil open source d'autoscaling pour Kubernetes. Il permet d'adapter automatiquement la capacité de calcul d'un cluster en fonction des besoins des applications.
+
+Dans notre environnement Amazon EKS, Karpenter automatise principalement la création et la suppression des instances EC2 utilisées comme nœuds Kubernetes.
+
+L'objectif est de :
+- Ajouter automatiquement des nœuds lorsque les ressources disponibles ne suffisent plus.
+- Réduire les ressources inutilisées afin d'optimiser les coûts.
+- Adapter la capacité du cluster aux besoins des workloads.
+- Simplifier la gestion de l'infrastructure Kubernetes.
+
+## 2. Architecture et fonctionnement
+
+Les principaux composants utilisés sont :
+
+**Karpenter Controller**
+
+C'est le composant central de Karpenter. Il surveille les pods qui ne peuvent pas être planifiés sur les nœuds existants. Il analyse leurs besoins en ressources et les contraintes de planification, puis demande la création d'instances EC2 adaptées.
+
+**NodePool**
+
+Le NodePool définit les règles de provisionnement des nœuds Kubernetes. Il permet notamment de configurer :
+- Les types d'instances autorisés.
+- Les ressources et capacités recherchées.
+- Les contraintes de provisionnement.
+- Les règles de consolidation.
+- Les limites de ressources du pool.
+
+**EC2NodeClass**
+
+L'EC2NodeClass définit la configuration AWS des instances EC2 créées par Karpenter. Il contient notamment les informations relatives :
+- Aux AMI utilisées.
+- Aux subnets et groupes de sécurité.
+- Au rôle IAM des nœuds.
+- Aux paramètres de stockage et aux tags AWS.
+
+### Cycle de fonctionnement
+
+1. Un pod est créé, mais aucun nœud disponible ne peut l'accueillir.
+2. Karpenter détecte le pod en attente.
+3. Le Controller analyse ses besoins et les contraintes du NodePool.
+4. Karpenter sélectionne une configuration compatible à partir de l'EC2NodeClass.
+5. Une instance EC2 est provisionnée.
+6. Le nouveau nœud rejoint le cluster EKS et peut accueillir le pod.
+
+Lorsque des nœuds deviennent inutilisés ou sous-utilisés, Karpenter peut également les supprimer ou déplacer leurs workloads vers d'autres nœuds, selon les règles de consolidation.
+
+## 3. Organisation des fichiers
+
+Le projet est organisé autour de deux parties : la configuration de l'infrastructure AWS avec Terraform et la configuration Kubernetes déployée avec Helm et Argo CD.
+
+### 3.1. Partie Terraform
+
+| Fichier | Rôle |
+|---|---|
+| `main.tf` | Définit les principaux composants Terraform et l'intégration de Karpenter à l'infrastructure EKS. |
+| `iam.tf` | Définit les rôles, politiques et permissions IAM nécessaires au Controller et aux nœuds, selon les ressources prises en charge par le projet. |
+| `variables.tf` | Déclare les variables utilisées pour rendre la configuration réutilisable. |
+| `outputs.tf` | Expose les informations utiles après le déploiement, comme certains ARN ou identifiants. |
+| `terraform.tfvars` | Contient les valeurs des variables propres à un environnement. |
+| `versions.tf` | Définit les versions de Terraform, des providers et des modules utilisés. |
+
+Le module EKS Blueprints Addons peut notamment être utilisé pour intégrer Karpenter à l'environnement EKS. Il faut vérifier les ressources effectivement gérées par ce module avant de créer des ressources IAM supplémentaires, afin d'éviter les doublons.
+
+### 3.2. Partie Helm et Kubernetes
+
+Répertoire : `infrastructure/charts/karpenter/`
+
+| Fichier | Rôle |
+|---|---|
+| `Chart.yaml` | Contient les métadonnées du chart Helm : nom, version et description. |
+| `values.yaml` | Centralise les valeurs utilisées par le chart Helm. |
+| `argocd-application.yaml` | Définit l'application Argo CD, le dépôt Git, le chemin source, la branche et la destination du déploiement. |
+| `templates/nodepool-default.yaml` | Définit le NodePool et ses règles de provisionnement et de consolidation. |
+| `templates/ec2nodeclass-default.yaml` | Définit la configuration AWS utilisée pour créer les instances EC2. |
+
+Les fichiers Terraform préparent les ressources nécessaires côté AWS, tandis que les fichiers Helm/Kubernetes décrivent les composants et paramètres utilisés dans le cluster.
+
+## 4. Gestion de la consolidation
+
+La consolidation permet à Karpenter d'optimiser l'utilisation des ressources en supprimant les nœuds inutilisés ou sous-utilisés, lorsque les workloads peuvent être déplacés sans compromettre leur fonctionnement.
+
+La politique configurée dans le projet est :
+
+`consolidationPolicy: WhenEmptyOrUnderutilized`
+
+Cette politique permet à Karpenter de considérer :
+- Les nœuds complètement vides.
+- Les nœuds sous-utilisés dont les workloads peuvent être déplacés vers d'autres nœuds compatibles.
+
+Le délai avant consolidation est adapté à l'environnement :
+
+| Environnement | consolidateAfter |
+|---|---|
+| Dev | `1m` |
+| Prod | `5m` |
+
+**Pourquoi ces délais ?**
+
+- **Dev – 1 minute :** permet de libérer rapidement les ressources inutilisées et de limiter les coûts dans un environnement de développement.
+- **Prod – 5 minutes :** offre davantage de stabilité et réduit les interventions trop fréquentes sur les nœuds.
+
+Pour les workloads sensibles aux interruptions, la politique `WhenEmpty` peut être envisagée. Elle limite la consolidation aux nœuds vides.
+
+La consolidation doit également tenir compte des PodDisruptionBudgets (PDB), des contraintes d'affinité et des règles de planification des applications.
+
+## 5. Déploiement et gestion avec GitOps
+
+Le déploiement s'appuie sur Terraform, Helm et Argo CD.
+
+Le processus général est le suivant :
+
+1. **Terraform :** prépare les ressources AWS et les permissions nécessaires à Karpenter.
+2. **Helm :** organise les configurations Kubernetes dans un chart.
+3. **GitHub :** héberge les fichiers de configuration et permet de gérer les modifications par branches et pull requests.
+4. **Argo CD :** surveille le dépôt Git et synchronise les configurations avec le cluster EKS.
+5. **Karpenter :** applique les règles de provisionnement et de consolidation dans le cluster.
+
+Les modifications doivent être réalisées dans le dépôt Git, puis intégrées selon le processus de validation et de déploiement de l'équipe.
+
+## 6. Vérification et diagnostic
+
+Après un déploiement ou une modification, les éléments suivants peuvent être vérifiés depuis un environnement disposant des accès autorisés au cluster.
+
+**Vérifier le Controller :**
+
+```bash
+kubectl get pods -n kube-system
+```
+
+**Vérifier les ressources Karpenter :**
+
+```bash
+kubectl get nodepools
+kubectl get ec2nodeclasses
+```
+
+**Vérifier les nœuds du cluster :**
+
+```bash
+kubectl get nodes
+```
+
+**Consulter les journaux du Controller :**
+
+```bash
+kubectl logs -n kube-system deployment/karpenter
+```
+
+En cas de problème, vérifier notamment :
+- Les permissions IAM du Controller et des nœuds.
+- Les tags de découverte des subnets et des groupes de sécurité.
+- Les contraintes définies dans le NodePool.
+- La configuration de l'EC2NodeClass.
+- Les événements Kubernetes et les journaux du Controller.
+- La synchronisation de l'application dans Argo CD.
+
+## 7. Points importants pour la maintenance
+
+Avant de modifier la configuration, il est important de vérifier :
+- La compatibilité entre les versions de Karpenter, des CRD et du chart Helm.
+- Les permissions IAM nécessaires au provisionnement des instances.
+- Les tags AWS utilisés pour la découverte des ressources.
+- Les contraintes du NodePool et les types d'instances autorisés.
+- Les délais et politiques de consolidation propres à chaque environnement.
+- Les contraintes de disponibilité des applications en production.
+
+**À retenir :** Terraform gère l'infrastructure et les permissions AWS, Helm structure les configurations Kubernetes, Argo CD assure leur déploiement GitOps et Karpenter gère dynamiquement la capacité des nœuds du cluster EKS.

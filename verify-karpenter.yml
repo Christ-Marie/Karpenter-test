@@ -1,47 +1,192 @@
 
-name: Verify Karpenter
+name: Verify Karpenter Capacity - Feature
 
 on:
   workflow_dispatch:
+    inputs:
+      run_capacity_test:
+        description: "Run temporary capacity test in FEATURE"
+        required: true
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
 
 permissions:
   contents: read
 
 jobs:
-  verify:
-    # Remplace ces labels par ceux du runner privé réel.
+  verify-capacity:
     runs-on: [self-hosted, vpc-runner]
+    environment: feature
 
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      EKS_ENVIRONMENT: feature
 
     steps:
       - name: Verify AWS identity
         shell: bash
         run: |
+          set -euo pipefail
           aws sts get-caller-identity
 
       - name: Configure Kubernetes access
         shell: bash
         run: |
+          set -euo pipefail
+
+          test -n "$AWS_REGION"
+          test -n "$EKS_CLUSTER_NAME"
+
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION"
 
-      - name: Check Kubernetes nodes
+          kubectl cluster-info
+
+      - name: Verify target environment
         shell: bash
         run: |
+          set -euo pipefail
+          echo "Target environment: $EKS_ENVIRONMENT"
+          echo "Target cluster: $EKS_CLUSTER_NAME"
+
+      - name: Check current capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Current nodes ==="
           kubectl get nodes -o wide
 
-      - name: Check Karpenter resources
-        shell: bash
-        run: |
+          echo "=== Karpenter-managed nodes ==="
+          kubectl get nodes \
+            -l karpenter.sh/nodepool -o wide
+
+          echo "=== NodePools ==="
           kubectl get nodepools
+
+          echo "=== NodeClaims ==="
           kubectl get nodeclaims
+
+          echo "=== EC2NodeClasses ==="
           kubectl get ec2nodeclasses
 
-      - name: Find Karpenter controller
+          echo "=== Karpenter controller pods ==="
+          kubectl get pods -A | grep -i karpenter || true
+
+      - name: Inspect NodePools and EC2NodeClasses
         shell: bash
         run: |
-          kubectl get pods -A | grep karpenter
+          set -euo pipefail
+
+          kubectl describe nodepools
+          kubectl describe ec2nodeclasses
+
+      - name: Validate feature environment
+        if: ${{ inputs.run_capacity_test == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$EKS_ENVIRONMENT" != "feature" ]]; then
+            echo "ERROR: Capacity test allowed only in FEATURE."
+            exit 1
+          fi
+
+          echo "Feature environment validated."
+
+      - name: Capture capacity before test
+        if: ${{ inputs.run_capacity_test == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get nodes -o wide
+          kubectl get nodeclaims
+
+      - name: Create temporary workload
+        if: ${{ inputs.run_capacity_test == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl create namespace karpenter-capacity-test \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: capacity-test
+            namespace: karpenter-capacity-test
+          spec:
+            replicas: 6
+            selector:
+              matchLabels:
+                app: capacity-test
+            template:
+              metadata:
+                labels:
+                  app: capacity-test
+              spec:
+                nodeSelector:
+                  karpenter.sh/nodepool: general
+                containers:
+                  - name: pause
+                    image: registry.k8s.io/pause:3.10
+                    resources:
+                      requests:
+                        cpu: "1"
+                        memory: "1Gi"
+          EOF
+
+      - name: Observe Karpenter provisioning
+        if: ${{ inputs.run_capacity_test == 'true' }}
+        shell: bash
+        run: |
+          set +e
+
+          echo "=== Waiting for pods to be scheduled ==="
+          kubectl rollout status deployment/capacity-test \
+            -n karpenter-capacity-test \
+            --timeout=8m
+
+          rollout_status=$?
+
+          echo "=== Test pods ==="
+          kubectl get pods \
+            -n karpenter-capacity-test -o wide
+
+          echo "=== Nodes after test ==="
+          kubectl get nodes -o wide
+
+          echo "=== NodeClaims after test ==="
+          kubectl get nodeclaims
+
+          echo "=== Recent cluster events ==="
+          kubectl get events -A \
+            --sort-by=.metadata.creationTimestamp | tail -n 60
+
+          echo "=== Pod scheduling details ==="
+          kubectl describe pods \
+            -n karpenter-capacity-test
+
+          echo "=== Karpenter controller logs ==="
+          kubectl logs -A \
+            -l app.kubernetes.io/name=karpenter \
+            --all-containers=true \
+            --since=15m || true
+
+          exit "$rollout_status"
+
+      - name: Clean up temporary workload
+        if: ${{ always() && inputs.run_capacity_test == 'true' }}
+        shell: bash
+        run: |
+          kubectl delete namespace karpenter-capacity-test \
+            --wait=false \
+            --ignore-not-found=true
